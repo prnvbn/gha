@@ -58,7 +58,10 @@ runs:
             throw error;
           }
           if (release.draft || release.prerelease) throw new Error('Select a stable release');
-          if (event && release.id !== event.id) return;
+          if (event && release.id !== event.id) {
+            core.info('Skipping release because it is not marked as latest');
+            return;
+          }
           core.setOutput('tag', release.tag_name);
 
     - name: Create tap token
