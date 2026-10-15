@@ -1,0 +1,115 @@
+name: Homebrew release
+description: Update a formula in a Homebrew tap from the latest stable release.
+inputs:
+  app-id:
+    description: GitHub App ID
+    required: true
+  app-private-key:
+    description: GitHub App private key
+    required: true
+  tap:
+    description: Homebrew tap repository
+    default: prnvbn/homebrew-tap
+  version:
+    description: Manual version override, otherwise use the latest stable release
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: Check secrets
+      shell: bash
+      env:
+        APP_ID: ${{ inputs.app-id }}
+        APP_PRIVATE_KEY: ${{ inputs.app-private-key }}
+      run: |
+        missing=0
+        if [[ -z "${APP_ID//[[:space:]]/}" ]]; then
+          echo "::error::Configure GH_APP_ID and pass it as app-id."
+          missing=1
+        fi
+        if [[ -z "${APP_PRIVATE_KEY//[[:space:]]/}" ]]; then
+          echo "::error::Configure GH_APP_PRIVATE_KEY and pass it as app-private-key."
+          missing=1
+        fi
+        exit "$missing"
+
+    - name: Select release
+      id: release
+      uses: actions/github-script@v9
+      env:
+        VERSION: ${{ inputs.version }}
+        TAP: ${{ inputs.tap }}
+      with:
+        script: |
+          const [owner, repo, extra] = process.env.TAP.split('/');
+          if (!owner || !repo || extra) throw new Error('tap must be owner/repository');
+          core.setOutput('owner', owner);
+          core.setOutput('repo', repo);
+          const event = context.payload.release;
+          if (event?.draft || event?.prerelease) return;
+          const version = context.eventName === 'workflow_dispatch' ? process.env.VERSION.trim() : '';
+          let release;
+          try {
+            release = version
+              ? (await github.rest.repos.getReleaseByTag({ ...context.repo, tag: version.startsWith('v') ? version : `v${version}` })).data
+              : (await github.rest.repos.getLatestRelease(context.repo)).data;
+          } catch (error) {
+            if (error.status === 404 && event && !version) return;
+            throw error;
+          }
+          if (release.draft || release.prerelease) throw new Error('Select a stable release');
+          if (event && release.id !== event.id) return;
+          core.setOutput('tag', release.tag_name);
+
+    - name: Create tap token
+      if: steps.release.outputs.tag != ''
+      id: token
+      uses: actions/create-github-app-token@v2
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.app-private-key }}
+        owner: ${{ steps.release.outputs.owner }}
+        repositories: ${{ steps.release.outputs.repo }}
+        permission-contents: write
+
+    - name: Update formula
+      if: steps.release.outputs.tag != ''
+      uses: actions/github-script@v9
+      env:
+        TAP: ${{ inputs.tap }}
+        TAG: ${{ steps.release.outputs.tag }}
+      with:
+        github-token: ${{ steps.token.outputs.token }}
+        script: |
+          const { createHash } = require('node:crypto');
+          const [owner, repo] = process.env.TAP.split('/');
+          const name = context.repo.repo;
+          const tag = process.env.TAG;
+          if (!/^v?\d+\.\d+\.\d+(?:[+.-][A-Za-z0-9.-]+)?$/.test(tag)) throw new Error('Invalid version tag');
+          const path = `Formula/${name}.rb`;
+          const { data: file } = await github.rest.repos.getContent({ owner, repo, path, ref: 'main' });
+          const original = Buffer.from(file.content, 'base64').toString();
+          const lines = original.split('\n');
+          const versions = lines.flatMap((line, i) => /^\s*version "/.test(line) ? [i] : []);
+          if (versions.length !== 1) throw new Error('Expected one formula version');
+          lines[versions[0]] = `  version "${tag.replace(/^v/, '')}"`;
+          for (const platform of ['darwin-arm64', 'darwin-amd64', 'linux-arm64', 'linux-amd64']) {
+            const asset = `${name}-${platform}`;
+            const matches = lines.flatMap((line, i) => /^\s*url "/.test(line) && line.trimEnd().endsWith(`/v#{version}/${asset}"`) ? [i] : []);
+            if (matches.length !== 1 || !/^\s*sha256 "[a-fA-F0-9]{64}"\s*$/.test(lines[matches[0] + 1] || '')) {
+              throw new Error(`Expected one URL/checksum pair for ${asset}`);
+            }
+            const url = `https://github.com/${context.repo.owner}/${name}/releases/download/${tag}/${asset}`;
+            const response = await fetch(url, { signal: AbortSignal.timeout(120000) });
+            if (!response.ok) throw new Error(`Download failed for ${asset}: HTTP ${response.status}`);
+            const hash = createHash('sha256');
+            for await (const chunk of response.body) hash.update(chunk);
+            lines[matches[0] + 1] = lines[matches[0] + 1].replace(/[a-fA-F0-9]{64}/, hash.digest('hex'));
+          }
+          const content = lines.join('\n');
+          if (content === original) return core.info('Formula already up to date');
+          await github.rest.repos.createOrUpdateFileContents({
+            owner, repo, path, branch: 'main', sha: file.sha,
+            message: `Update ${name} formula to ${tag.replace(/^v/, '')}`,
+            content: Buffer.from(content).toString('base64'),
+          });
