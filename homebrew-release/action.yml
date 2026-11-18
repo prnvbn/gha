@@ -1,5 +1,5 @@
 name: Homebrew release
-description: Update a formula in a Homebrew tap from the latest stable release.
+description: Update a Homebrew formula or cask from a stable GitHub release.
 inputs:
   app-id:
     description: GitHub App ID
@@ -13,6 +13,30 @@ inputs:
   version:
     description: Manual version override, otherwise use the latest stable release
     default: ""
+  package-type:
+    description: Package type, formula or cask
+    default: formula
+  cask:
+    description: "Homebrew cask token"
+    required: false
+  asset:
+    description: "Release asset filename with optional {version} placeholder"
+    required: false
+  app-name:
+    description: "App name without .app"
+    required: false
+  description:
+    description: "Short app description"
+    required: false
+  homepage:
+    description: "App homepage URL"
+    required: false
+  macos:
+    description: "Minimum macOS codename"
+    default: "tahoe"
+  arch:
+    description: "Supported architecture: arm64 or intel"
+    default: "arm64"
 runs:
   using: composite
   steps:
@@ -37,10 +61,13 @@ runs:
       id: release
       uses: actions/github-script@v9
       env:
+        PACKAGE_TYPE: ${{ inputs.package-type }}
+        ASSET: ${{ inputs.asset }}
         VERSION: ${{ inputs.version }}
         TAP: ${{ inputs.tap }}
       with:
         script: |
+          if (!['formula', 'cask'].includes(process.env.PACKAGE_TYPE)) throw new Error('package-type must be formula or cask');
           const [owner, repo, extra] = process.env.TAP.split('/');
           if (!owner || !repo || extra) throw new Error('tap must be owner/repository');
           core.setOutput('owner', owner);
@@ -54,13 +81,19 @@ runs:
               ? (await github.rest.repos.getReleaseByTag({ ...context.repo, tag: version.startsWith('v') ? version : `v${version}` })).data
               : (await github.rest.repos.getLatestRelease(context.repo)).data;
           } catch (error) {
-            if (error.status === 404 && event && !version) return;
+            if (error.status === 404 && !version && context.eventName !== 'workflow_dispatch') return;
             throw error;
           }
           if (release.draft || release.prerelease) throw new Error('Select a stable release');
           if (event && release.id !== event.id) {
             core.info('Skipping release because it is not marked as latest');
             return;
+          }
+          if (process.env.PACKAGE_TYPE === 'cask') {
+            if (!/^v\d+\.\d+\.\d+$/.test(release.tag_name)) throw new Error('Expected vMAJOR.MINOR.PATCH tag');
+            const asset = release.assets.find(asset => asset.name === process.env.ASSET.replaceAll('{version}', release.tag_name.slice(1)));
+            if (!asset) throw new Error('Release is missing the requested asset');
+            core.setOutput('url', asset.browser_download_url);
           }
           core.setOutput('tag', release.tag_name);
 
@@ -76,43 +109,34 @@ runs:
         permission-contents: write
 
     - name: Update formula
-      if: steps.release.outputs.tag != ''
+      if: steps.release.outputs.tag != '' && inputs.package-type == 'formula'
       uses: actions/github-script@v9
       env:
+        ACTION_PATH: ${{ github.action_path }}
         TAP: ${{ inputs.tap }}
         TAG: ${{ steps.release.outputs.tag }}
       with:
         github-token: ${{ steps.token.outputs.token }}
         script: |
-          const { createHash } = require('node:crypto');
-          const [owner, repo] = process.env.TAP.split('/');
-          const name = context.repo.repo;
-          const tag = process.env.TAG;
-          if (!/^v?\d+\.\d+\.\d+(?:[+.-][A-Za-z0-9.-]+)?$/.test(tag)) throw new Error('Invalid version tag');
-          const path = `Formula/${name}.rb`;
-          const { data: file } = await github.rest.repos.getContent({ owner, repo, path, ref: 'main' });
-          const original = Buffer.from(file.content, 'base64').toString();
-          const lines = original.split('\n');
-          const versions = lines.flatMap((line, i) => /^\s*version "/.test(line) ? [i] : []);
-          if (versions.length !== 1) throw new Error('Expected one formula version');
-          lines[versions[0]] = `  version "${tag.replace(/^v/, '')}"`;
-          for (const platform of ['darwin-arm64', 'darwin-amd64', 'linux-arm64', 'linux-amd64']) {
-            const asset = `${name}-${platform}`;
-            const matches = lines.flatMap((line, i) => /^\s*url "/.test(line) && line.trimEnd().endsWith(`/v#{version}/${asset}"`) ? [i] : []);
-            if (matches.length !== 1 || !/^\s*sha256 "[a-fA-F0-9]{64}"\s*$/.test(lines[matches[0] + 1] || '')) {
-              throw new Error(`Expected one URL/checksum pair for ${asset}`);
-            }
-            const url = `https://github.com/${context.repo.owner}/${name}/releases/download/${tag}/${asset}`;
-            const response = await fetch(url, { signal: AbortSignal.timeout(120000) });
-            if (!response.ok) throw new Error(`Download failed for ${asset}: HTTP ${response.status}`);
-            const hash = createHash('sha256');
-            for await (const chunk of response.body) hash.update(chunk);
-            lines[matches[0] + 1] = lines[matches[0] + 1].replace(/[a-fA-F0-9]{64}/, hash.digest('hex'));
-          }
-          const content = lines.join('\n');
-          if (content === original) return core.info('Formula already up to date');
-          await github.rest.repos.createOrUpdateFileContents({
-            owner, repo, path, branch: 'main', sha: file.sha,
-            message: `Update ${name} formula to ${tag.replace(/^v/, '')}`,
-            content: Buffer.from(content).toString('base64'),
-          });
+          const update = require(`${process.env.ACTION_PATH}/update-formula.cjs`);
+          await update({ github, core, context });
+
+    - name: Update cask
+      if: steps.release.outputs.tag != '' && inputs.package-type == 'cask'
+      uses: actions/github-script@v9
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        TAP: ${{ inputs.tap }}
+        CASK: ${{ inputs.cask }}
+        APP_NAME: ${{ inputs.app-name }}
+        DESCRIPTION: ${{ inputs.description }}
+        HOMEPAGE: ${{ inputs.homepage }}
+        MACOS: ${{ inputs.macos }}
+        ARCH: ${{ inputs.arch }}
+        TAG: ${{ steps.release.outputs.tag }}
+        ASSET_URL: ${{ steps.release.outputs.url }}
+      with:
+        github-token: ${{ steps.token.outputs.token }}
+        script: |
+          const update = require(`${process.env.ACTION_PATH}/update-cask.cjs`);
+          await update({ github, core });
