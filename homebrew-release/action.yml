@@ -74,6 +74,11 @@ runs:
           core.setOutput('repo', repo);
           const event = context.payload.release;
           if (event?.draft || event?.prerelease) return;
+          const { data: sourceRepository } = await github.rest.repos.get(context.repo);
+          if (sourceRepository.private) {
+            core.setFailed(`Cannot publish a Homebrew package from private repository ${context.repo.owner}/${context.repo.repo}. Release downloads require authentication, but the generated package uses public download URLs. Make the repository public before rerunning, or use a separate distribution setup that supports authenticated downloads.`);
+            return;
+          }
           const version = context.eventName === 'workflow_dispatch' ? process.env.VERSION.trim() : '';
           let release;
           try {
@@ -81,7 +86,18 @@ runs:
               ? (await github.rest.repos.getReleaseByTag({ ...context.repo, tag: version.startsWith('v') ? version : `v${version}` })).data
               : (await github.rest.repos.getLatestRelease(context.repo)).data;
           } catch (error) {
-            if (error.status === 404 && !version && context.eventName !== 'workflow_dispatch') return;
+            if (error.status === 404) {
+              const repository = `${context.repo.owner}/${context.repo.repo}`;
+              if (version) {
+                const tag = version.startsWith('v') ? version : `v${version}`;
+                core.setFailed(`No accessible release found for tag ${tag} in ${repository}. Check the version and publish a stable GitHub release for that tag; a Git tag alone is not enough.`);
+              } else {
+                const message = `No accessible stable release found in ${repository}. Drafts and prereleases are excluded. Publish a stable release or mark an existing prerelease as stable, then rerun this workflow.`;
+                if (context.eventName === 'workflow_dispatch') core.setFailed(message);
+                else core.info(`Skipping Homebrew update: ${message}`);
+              }
+              return;
+            }
             throw error;
           }
           if (release.draft || release.prerelease) throw new Error('Select a stable release');
